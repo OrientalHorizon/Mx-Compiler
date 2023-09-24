@@ -1,312 +1,215 @@
 package asm;
 
-import asm.*;
-import asm.operand.*;
-import asm.instruction.*;
+import java.util.HashMap;
 
 import ir.*;
 import ir.instruction.*;
-import ir.type.*;
 import ir.entity.*;
-
-import util.error.*;
+import ir.type.*;
+import asm.*;
+import asm.operand.*;
 import util.*;
-
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedList;
-import java.lang.Math;
+import asm.instruction.*;
 
 public class InstructionSelector implements IRVisitor {
-    public ASMModule module;
-    public ASMFunction currentFunction;
-    public ASMBlock currentBlock;
+    ASMModule module;
+    ASMFunction curFunc;
+    ASMBlock curBlock;
+    int blockCnt = 0;
 
-    public int virtualRegPos, totalStackBytes;
+    HashMap<IRBasicBlock, ASMBlock> blockMap = new HashMap<>();
 
-    public LinkedHashMap<IRBasicBlock, ASMBlock> blockMap = new LinkedHashMap<>();
-    private ASMPhysicalRegister regSp = ASMPhysicalRegister.pRegMap.get("sp");
-    private ASMPhysicalRegister regA0 = ASMPhysicalRegister.pRegMap.get("a0");
-    private ASMPhysicalRegister regRa = ASMPhysicalRegister.pRegMap.get("ra");
     public InstructionSelector(ASMModule module) {
         this.module = module;
     }
 
-//    private ASMRegister immGetRegister(ASMImmediate imm) {
-//        ASMVirtualRegister reg = new ASMVirtualRegister(4);
-//        currentBlock.addInstruction(new ASMLi(reg, imm));
-//        return reg;
-//    } // 不兼容，不 li 怎么知道立即数是多少
-
-    private ASMRegister getASMRegister(Entity entity) {
-//        if (entity.asmRegister instanceof ASMPhysicalRegister && ((ASMPhysicalRegister) entity.asmRegister).label.equals("s5")) {
-//            System.out.println(entity.toString());
-//        }
-        if (entity.asmRegister == null || entity.asmRegister instanceof ASMStackLocation) {
+    ASMRegister getReg(Entity entity) {
+        if (entity.asmRegister == null) {
+            assert !(entity instanceof IRGlobalVar);
+            assert !(entity instanceof IRStringConst);
             if (entity instanceof IRRegister) {
-                entity.asmRegister = new ASMVirtualRegister(entity.type.getBytes()); // TODO: check
-            }
-            else if (entity instanceof IRConst) {
+                entity.asmRegister = new ASMVirtualRegister(entity.type.getBytes());
+            } else if (entity instanceof IRConst) {
                 entity.asmRegister = new ASMVirtualImmediate((IRConst) entity);
             }
         }
         return entity.asmRegister;
     }
-
-    private void addStore(int size, ASMRegister value, ASMRegister addr, int imm) {
-        // 存到 reg[addr] + imm
-        if (imm < 2048 && imm >= -2048) {
-            currentBlock.addInstruction(new ASMStore(size, value, new ASMImmediate(imm), addr));
-        }
+    void storeReg(int size, ASMRegister value, ASMRegister dest, int offset) {
+        if (offset < 1 << 11)
+            curBlock.addInstruction(new ASMStore(size, value, new ASMImmediate(offset), dest));
         else {
-            ASMVirtualRegister reg = new ASMVirtualRegister(4);
-            currentBlock.addInstruction(
-                    new ASMRType("add", reg, addr,
-                            new ASMVirtualImmediate(imm)
-                    )
-            );
-            currentBlock.addInstruction(new ASMStore(size, value, reg));
+            ASMVirtualRegister tmp = new ASMVirtualRegister(4);
+            curBlock.addInstruction(new ASMRType("add", tmp, dest, new ASMVirtualImmediate(offset)));
+            curBlock.addInstruction(new ASMStore(size, tmp, value));
+        }
+    }
+    void loadReg(int size, ASMRegister dest, ASMRegister src, int offset) {
+        if (offset < 1 << 11)
+            curBlock.addInstruction(new ASMLoad(size, dest, new ASMImmediate(offset), src));
+        else {
+            ASMVirtualRegister tmp = new ASMVirtualRegister(4);
+            curBlock.addInstruction(new ASMRType("add", tmp, src, new ASMVirtualImmediate(offset)));
+            curBlock.addInstruction(new ASMLoad(size, dest, tmp));
         }
     }
 
-    private void addLoad(int size, ASMRegister toReg, ASMRegister addr, int imm) {
-        // 从 reg[addr] + imm 加载
-        if (imm < 2048 && imm >= -2048) {
-            currentBlock.addInstruction(new ASMLoad(size, toReg, new ASMImmediate(imm), addr));
-        }
-        else {
-            ASMVirtualRegister reg = new ASMVirtualRegister(4);
-            currentBlock.addInstruction(
-                    new ASMRType("add", reg, addr,
-                            new ASMVirtualImmediate(imm)
-                    )
-            );
-            currentBlock.addInstruction(new ASMLoad(size, toReg, reg));
-        }
-    }
-
-    @Override
-    public void visit(IRProgram it) {
-        for (var str: it.stringArray) {
-            ASMGlobalString globalString = new ASMGlobalString(".str", str.value);
-            module.strings.add(globalString);
-            str.asmRegister = globalString;
-        }
-
-        for (var globalVar: it.globalVars) {
+    public void visit(IRProgram node) {
+        // add global vars
+        node.globalVars.forEach(globalVar -> {
             globalVar.asmRegister = new ASMGlobalValue(globalVar);
             module.globalValues.add((ASMGlobalValue) globalVar.asmRegister);
-        }
-
-        for (var func: it.functions) {
-            LinearScan linearScan = new LinearScan(func);
-            currentFunction = new ASMFunction(func.name);
-            module.functions.add(currentFunction);
+        });
+        node.stringConsts.values().forEach(str -> {
+            ASMGlobalString globalStr = new ASMGlobalString(".str." + String.valueOf(str.id), str.value);
+            module.strings.add(globalStr);
+            str.asmRegister = globalStr;
+        });
+//        if (node.initFunc != null) {
+//            curFunc = new ASMFunction(node.initFunc.name);
+//            module.functions.add(curFunc);
+//            node.initFunc.accept(this);
+//        }
+        node.functions.forEach(func -> {
+            curFunc = new ASMFunction(func.name);
+            module.functions.add(curFunc);
             func.accept(this);
-            currentFunction = null;
-        }
+        });
     }
 
-    @Override
-    public void visit(IRFunction it) {
+    public void visit(IRFunction node) {
+        // add params
+        blockMap.clear();
         ASMVirtualRegister.cnt = 0;
-        int maxParam = 0;
-        blockMap = new LinkedHashMap<>();
-
-        for (IRBasicBlock block: it.blocks) {
-            ASMBlock tmpBlock = new ASMBlock(block.label);
-            blockMap.put(block, tmpBlock);
-            currentFunction.add(tmpBlock);
-            for (IRInstruction instruction: block.instructions) {
-                if (instruction instanceof IRCall) {
-                    maxParam = Math.max(maxParam, ((IRCall) instruction).args.size());
-                }
-            }
+        // find max argument cnt
+        int maxArgCnt = 0;
+        for (IRBasicBlock blk : node.blocks) {
+            blockMap.put(blk, new ASMBlock(".L" + blockCnt++));
+            for (IRInstruction inst : blk.instructions)
+                if (inst instanceof IRCall)
+                    maxArgCnt = Math.max(maxArgCnt, ((IRCall) inst).args.size());
         }
-        currentFunction.exceedingParamBytes = (maxParam > 8) ? (maxParam - 8) * 4 : 0;
-        // caller 保存多余的参数
+        curFunc.exceedingParamBytes = (maxArgCnt > 8 ? maxArgCnt - 8 : 0) << 2;
+        // set params
+        for (int i = 0; i < node.paramList.size(); ++i)
+            if (i < 8)
+                node.paramList.get(i).asmRegister = new ASMPhysicalRegister("a" + i);
+            else
+                node.paramList.get(i).asmRegister = new ASMVirtualRegister(4, i);
 
-        for (int i = 0; i < it.paramList.size(); ++i) {
-            IRRegister param = it.paramList.get(i);
-            param.asmRegister = i < 8 ?
-                new ASMPhysicalRegister("a" + String.valueOf(i)) :
-                new ASMVirtualRegister(4, i); // exceeding parameter，由于函数的栈空间最靠近栈顶的位置就是存的 exceeding param.，所以继续往上走就能找到它
+        for (int i = 0; i < node.blocks.size(); ++i) {
+            curBlock = blockMap.get(node.blocks.get(i));
+            if (i == 0)
+                storeReg(4, new ASMPhysicalRegister("ra"), new ASMPhysicalRegister("sp"), curFunc.exceedingParamBytes);
+            node.blocks.get(i).accept(this);
+            curFunc.add(curBlock);
         }
-
-        if (!it.blocks.isEmpty()) {
-            currentBlock = blockMap.get(it.blocks.getFirst());
-            addStore(4, regRa, regSp, currentFunction.exceedingParamBytes);
-            // 把 ra 的值存到相应栈空间，ra 有可能被调用的其他函数占了
-        }
-        for (var irBlock: it.blocks) {
-            currentBlock = blockMap.get(irBlock);
-            irBlock.accept(this);
-            currentBlock = null;
-        }
-
-        currentFunction.virtualRegCnt = ASMVirtualRegister.cnt;
-        currentFunction.virtualRegBytes = currentFunction.virtualRegCnt << 2;
-        currentFunction.totalStackSize = currentFunction.exceedingParamBytes
-                + currentFunction.virtualRegBytes + currentFunction.allocaBytes;
-
-        ASMBlock entryBlock = currentFunction.blocks.get(0);
-        ASMBlock exitBlock = currentFunction.blocks.get(currentFunction.blocks.size() - 1);
-
-        currentBlock = entryBlock;
-        entryBlock.instructions.addFirst(
-                new ASMRType("sub", regSp, regSp,
-                        new ASMVirtualImmediate(currentFunction.totalStackSize))
-        );
-
-        currentBlock = exitBlock;
-        exitBlock.instructions.add(new ASMRType(
-                "add", regSp, regSp, new ASMVirtualImmediate(currentFunction.totalStackSize))
-        );
+        curFunc.virtualRegCnt = ASMVirtualRegister.cnt;
+        // set stack frame
+        curFunc.virtualRegBytes = curFunc.virtualRegCnt * 4;
+        curFunc.totalStackSize = curFunc.exceedingParamBytes + curFunc.allocaBytes + curFunc.virtualRegCnt * 4;
+        ASMBlock entryBlock = curFunc.blocks.get(0), exitBlock = curFunc.blocks.get(curFunc.blocks.size() - 1);
+        entryBlock.instructions.addFirst(new ASMRType("add", new ASMPhysicalRegister("sp"), new ASMPhysicalRegister("sp"),
+                new ASMVirtualImmediate(-curFunc.totalStackSize)));
+        exitBlock.instructions.add(new ASMRType("add", new ASMPhysicalRegister("sp"), new ASMPhysicalRegister("sp"),
+                new ASMVirtualImmediate(curFunc.totalStackSize)));
         exitBlock.instructions.add(new ASMReturn());
-
-        currentBlock = null;
     }
 
-    @Override
-    public void visit(IRBasicBlock it) {
-        for (var instruction: it.instructions) {
-            instruction.accept(this);
+    public void visit(IRBasicBlock node) {
+        node.instructions.forEach(inst -> {
+            inst.accept(this);
+        });
+        node.terminal.accept(this);
+    }
+
+    public void visit(IRAlloca node) {
+        curBlock.addInstruction(new ASMRType("add", getReg(node.reg), new ASMPhysicalRegister("sp"),
+                new ASMVirtualImmediate(curFunc.exceedingParamBytes + curFunc.allocaBytes)));
+        curFunc.allocaBytes += 4;
+    }
+
+    public void visit(IRBranch node) {
+        curBlock.addInstruction(new ASMBranch(ASMBranch.Type.beqz, getReg(node.condition), blockMap.get(node.elseBlock)));
+        curBlock.addInstruction(new ASMJump(blockMap.get(node.thenBlock)));
+    }
+
+    public void visit(IRCalc node) {
+        curBlock.addInstruction(new ASMRType(node.opType.toString(), getReg(node.reg), getReg(node.lhs), getReg(node.rhs)));
+    }
+
+    public void visit(IRCall node) {
+        for (int i = 0; i < node.args.size(); ++i) {
+            Entity arg = node.args.get(i);
+            if (i < 8)
+                curBlock.addInstruction(new ASMMove(new ASMPhysicalRegister("a" + i), getReg(arg)));
+            else
+                storeReg(arg.type.getBytes(), getReg(arg), new ASMPhysicalRegister("sp"), i - 8 << 2);
         }
-        if (it.terminal != null) {
-            it.terminal.accept(this);
-        }
+        curBlock.addInstruction(new ASMCall(node.name));
+        if (node.addr != null)
+            curBlock.addInstruction(new ASMMove(getReg(node.addr), new ASMPhysicalRegister("a0")));
     }
 
-    @Override
-    public void visit(IRAlloca it) {
-        currentBlock.addInstruction(
-                new ASMRType("add", getASMRegister(it.reg), regSp,
-                        new ASMVirtualImmediate(
-                                currentFunction.exceedingParamBytes + currentFunction.allocaBytes
-                                ))
-        );
-        currentFunction.allocaBytes += 4;
-    }
-
-    @Override
-    public void visit(IRBinaryOpt it) {
-        // eq, ne, sgt, sge, slt, sle
-        ASMVirtualRegister reg = new ASMVirtualRegister(4);
-        // 存中间结果的
-        ASMRegister lhs = getASMRegister(it.lhs);
-        ASMRegister rhs = getASMRegister(it.rhs);
-        ASMRegister dest = getASMRegister(it.reg);
-
-        switch (it.opType) {
-            case eq -> {
-                currentBlock.addInstruction(new ASMRType("xor", reg, lhs, rhs));
-                currentBlock.addInstruction(new ASMIType("sltiu", dest, reg, new ASMImmediate(1)));
-            }
-            case ne -> {
-                currentBlock.addInstruction(new ASMRType("xor", reg, lhs, rhs));
-                currentBlock.addInstruction(new ASMRType("sltu", dest, new ASMVirtualImmediate(0), reg));
-            }
-            case sgt -> {
-                currentBlock.addInstruction(new ASMRType("slt", dest, rhs, lhs));
-            }
-            case sge -> {
-                currentBlock.addInstruction(new ASMRType("slt", reg, lhs, rhs));
-                currentBlock.addInstruction(new ASMIType("xori", dest, reg, new ASMImmediate(1)));
-            }
-            case slt -> {
-                currentBlock.addInstruction(new ASMRType("slt", dest, lhs, rhs));
-            }
-            case sle -> {
-                currentBlock.addInstruction(new ASMRType("slt", reg, rhs, lhs));
-                currentBlock.addInstruction(new ASMIType("xori", dest, reg, new ASMImmediate(1)));
-            }
+    public void visit(IRGetElementPtr node) {
+        if (node.type instanceof IRInt && ((IRInt) node.type).getBytes() == 1) {
+            curBlock.addInstruction(new ASMRType("add", getReg(node.dest), getReg(node.ptr), getReg(node.idxs.get(0))));
+        } else {
+            ASMRegister idx = node.type instanceof IRStruct ? getReg(node.idxs.get(1)) : getReg(node.idxs.get(0));
+            ASMVirtualRegister tmp = new ASMVirtualRegister(4);
+            curBlock.addInstruction(new ASMIType("slli", tmp, idx, new ASMImmediate(2)));
+            curBlock.addInstruction(new ASMRType("add", getReg(node.dest), getReg(node.ptr), tmp));
         }
     }
 
-    @Override
-    public void visit(IRBranch it) {
-        currentBlock.addInstruction(new ASMBranch(ASMBranch.Type.bnez, getASMRegister(it.condition), blockMap.get(it.thenBlock)));
-        currentBlock.addInstruction(new ASMJump(blockMap.get(it.elseBlock)));
-//        currentBlock.suc.add(blockMap.get(it.thenBlock));
-//        currentBlock.suc.add(blockMap.get(it.elseBlock));
-    }
-
-    @Override
-    public void visit(IRCalc it) {
-        // add, sub, mul, sdiv, srem, shl, ashr, and, or, xor
-        ASMRegister lhs = getASMRegister(it.lhs);
-        ASMRegister rhs = getASMRegister(it.rhs);
-        currentBlock.addInstruction(new ASMRType(it.opType.toString(), getASMRegister(it.reg), lhs, rhs));
-    }
-
-    @Override
-    public void visit(IRCall it) {
-        // 存东西
-        for (int i = 0; i < it.args.size(); ++i) {
-            if (i < 8) {
-                currentBlock.addInstruction(new ASMMove(ASMPhysicalRegister.pRegMap.get("a" + i), getASMRegister(it.args.get(i))));
-            }
-            else {
-                addStore(it.args.get(i).type.getBytes(), getASMRegister(it.args.get(i)), regSp, (i - 8) << 2);
-            }
-        }
-
-        currentBlock.addInstruction(new ASMCall(it.name));
-
-        // 返回值
-        if (it.returnType != null && !(it.returnType instanceof IRVoid) && !(it.returnType instanceof IRNull)) {
-            currentBlock.addInstruction(new ASMMove(getASMRegister(it.addr), regA0));
+    public void visit(IRBinaryOpt node) {
+        // LLVM_IR: eq, ne, sgt, sge, slt, sle
+        // RISCV32_ASM: seqz, snez, slt
+        ASMVirtualRegister tmp = new ASMVirtualRegister(4);
+        switch (node.opType.toString()) {
+            case "eq":
+                curBlock.addInstruction(new ASMRType("sub", tmp, getReg(node.lhs), getReg(node.rhs)));
+                curBlock.addInstruction(new ASMIType("seqz", getReg(node.reg), tmp));
+                break;
+            case "ne":
+                curBlock.addInstruction(new ASMRType("sub", tmp, getReg(node.lhs), getReg(node.rhs)));
+                curBlock.addInstruction(new ASMIType("snez", getReg(node.reg), tmp));
+                break;
+            case "sgt":
+                curBlock.addInstruction(new ASMRType("slt", getReg(node.reg), getReg(node.rhs), getReg(node.lhs)));
+                break;
+            case "sge":
+                curBlock.addInstruction(new ASMRType("slt", tmp, getReg(node.lhs), getReg(node.rhs)));
+                curBlock.addInstruction(new ASMIType("xori", getReg(node.reg), tmp, new ASMImmediate(1)));
+                break;
+            case "slt":
+                curBlock.addInstruction(new ASMRType("slt", getReg(node.reg), getReg(node.lhs), getReg(node.rhs)));
+                break;
+            case "sle":
+                curBlock.addInstruction(new ASMRType("slt", tmp, getReg(node.rhs), getReg(node.lhs)));
+                curBlock.addInstruction(new ASMIType("xori", getReg(node.reg), tmp, new ASMImmediate(1)));
+                break;
         }
     }
 
-    @Override
-    public void visit(IRGetElementPtr it) {
-        // 算地址，存到 dest 里面
-        if (it.type instanceof IRStruct) {
-            // 是类的解引用，要取第二个参数
-            ASMRegister id = getASMRegister(it.idxs.get(1));
-            ASMVirtualRegister reg = new ASMVirtualRegister(4);
-            currentBlock.addInstruction(new ASMRType("mul", reg, id, new ASMVirtualImmediate(4))); // 2?????????????
-            currentBlock.addInstruction(new ASMRType("add", getASMRegister(it.dest), reg, getASMRegister(it.ptr)));
-        }
-        else if (it.type instanceof IRInt && ((IRInt) it.type).getBytes() == 1) {
-            // 免 * 4
-            currentBlock.addInstruction(new ASMRType("add", getASMRegister(it.dest), getASMRegister(it.ptr), getASMRegister(it.idxs.get(0))));
-        }
-        else {
-            ASMRegister id = getASMRegister(it.idxs.get(0));
-            ASMVirtualRegister reg = new ASMVirtualRegister(4);
-            currentBlock.addInstruction(new ASMRType("mul", reg, id, new ASMVirtualImmediate(4)));
-            currentBlock.addInstruction(new ASMRType("add", getASMRegister(it.dest), reg, getASMRegister(it.ptr)));
-        }
+    public void visit(IRJump node) {
+        curBlock.addInstruction(new ASMJump(blockMap.get(node.dest)));
     }
 
-    @Override
-    public void visit(IRJump it) {
-        currentBlock.addInstruction(new ASMJump(blockMap.get(it.dest)));
-        // currentBlock.suc.add(blockMap.get(it.dest));
+    public void visit(IRLoad node) {
+        loadReg(node.type.getBytes(), getReg(node.dest), getReg(node.entity), 0);
     }
 
-    @Override
-    public void visit(IRLoad it) {
-        addLoad(it.type.getBytes(), getASMRegister(it.dest), getASMRegister(it.entity), 0);
+    public void visit(IRRet node) {
+        // ret val -> load val to a0 and return
+        if (!(node.value instanceof IRVoidConst) && !(node.value instanceof IRNullConst))
+            curBlock.addInstruction(new ASMMove(new ASMPhysicalRegister("a0"), getReg(node.value)));
+        loadReg(4, new ASMPhysicalRegister("ra"), new ASMPhysicalRegister("sp"), curFunc.exceedingParamBytes);
+        // 寄存器分配完再加 ret
     }
 
-    @Override
-    public void visit(IRStore it) {
-        addStore(it.val.type.getBytes(), getASMRegister(it.val), getASMRegister(it.addr), 0);
-    }
-
-    @Override
-    public void visit(IRRet it) {
-        // 如果返回值不是 void，那么需要把返回值存回 a0
-        // ra 存的是返回地址！！
-        addLoad(4, regRa, regSp, currentFunction.exceedingParamBytes);
-        // 从栈上 alloca 出的第一个位置取返回值（约定好的）
-        if (it.value == null || it.value instanceof IRNullConst || it.value instanceof IRVoidConst) {
-            // 直接return
-            return;
-        }
-        currentBlock.addInstruction(new ASMMove(regA0, getASMRegister(it.value)));
+    public void visit(IRStore node) {
+        // store : rs2 -> (rs1) address
+        storeReg(node.val.type.getBytes(), getReg(node.val), getReg(node.addr), 0);
     }
 }

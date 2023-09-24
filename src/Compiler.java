@@ -36,9 +36,9 @@ public class Compiler {
     }
 
     public static void main(String[] args) throws Exception {
-        InputStream inputS = new FileInputStream("test.mx");
-        CharStream input = CharStreams.fromStream(inputS);
-        // CharStream input = CharStreams.fromStream(System.in);
+//        InputStream inputS = new FileInputStream("test.mx");
+//        CharStream input = CharStreams.fromStream(inputS);
+        CharStream input = CharStreams.fromStream(System.in);
 
         try {
             ProgramNode root;
@@ -62,15 +62,15 @@ public class Compiler {
 
             String irOutput = irProgram.toString();
             // write to file test.ll
-            output(irOutput, "test.ll");
+            // output(irOutput, "test.ll");
 
             ASMModule module = new ASMModule();
             new InstructionSelector(module).visit(irProgram);
             new RegisterAllocator(module).visitFunction();
             String assembly = module.toString();
             // write to file test.s
-            output(assembly, "test.s");
-            // System.out.println(assembly);
+            // output(assembly, "test.s");
+            System.out.println(assembly);
         }
         catch (MyError error) {
             System.err.println(error.toString());
