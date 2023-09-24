@@ -61,7 +61,7 @@ public class InstructionSelector implements IRVisitor {
             module.globalValues.add((ASMGlobalValue) globalVar.asmRegister);
         });
         node.stringConsts.values().forEach(str -> {
-            ASMGlobalString globalStr = new ASMGlobalString(".str." + String.valueOf(str.id), str.value);
+            ASMGlobalString globalStr = new ASMGlobalString(".str", str.value);
             module.strings.add(globalStr);
             str.asmRegister = globalStr;
         });
