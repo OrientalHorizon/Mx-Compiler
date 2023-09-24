@@ -66,7 +66,7 @@ public class Compiler {
 
             ASMModule module = new ASMModule();
             new InstructionSelector(module).visit(irProgram);
-            new RegisterAllocator(module).visitFunction();
+            new RegisterAllocator(module).work();
             String assembly = module.toString();
             // write to file test.s
             // output(assembly, "test.s");

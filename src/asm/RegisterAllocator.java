@@ -1,102 +1,84 @@
 package asm;
 
+import java.util.LinkedList;
+
 import asm.*;
 import asm.operand.*;
 import asm.instruction.*;
 
-import ir.*;
-import ir.instruction.*;
-import ir.type.*;
-import ir.entity.*;
-
-import util.error.*;
-import util.*;
-
-import java.util.ArrayList;
-import java.util.LinkedList;
-
 public class RegisterAllocator {
     ASMModule module;
-    int totalStackBytes, virtualRegPos;
-
-    ASMPhysicalRegister regT0 = new ASMPhysicalRegister("t0");
-    ASMPhysicalRegister regT1 = new ASMPhysicalRegister("t1");
-    ASMPhysicalRegister regT2 = new ASMPhysicalRegister("t2");
-    ASMPhysicalRegister regSp = new ASMPhysicalRegister("sp");
+    int totalStack, virtualRegBegin;
+    ASMPhysicalRegister RegT0 = new ASMPhysicalRegister("t0");
+    ASMPhysicalRegister RegT1 = new ASMPhysicalRegister("t1");
+    ASMPhysicalRegister RegT2 = new ASMPhysicalRegister("t2");
+    ASMPhysicalRegister RegSp = new ASMPhysicalRegister("sp");
+    LinkedList<ASMInstruction> workList;
 
     public RegisterAllocator(ASMModule module) {
         this.module = module;
     }
 
-    public void visitFunction() {
+    public void work() {
         for (ASMFunction function : module.functions) {
-            totalStackBytes = function.totalStackSize;
-            virtualRegPos = function.exceedingParamBytes + function.allocaBytes;
+            totalStack = function.totalStackSize;
+            virtualRegBegin = function.exceedingParamBytes + function.allocaBytes;
             for (ASMBlock block : function.blocks)
                 visitBlock(block);
         }
     }
 
     public void visitBlock(ASMBlock block) {
-        LinkedList<ASMInstruction> extendedIns = new LinkedList<>();
-        for (var instruction: block.instructions) {
-            // 添一些该有的分配指令
-            if (instruction.rs1 != null && !(instruction.rs1 instanceof ASMPhysicalRegister)) {
-                allocateSrc(extendedIns, regT1, instruction.rs1);
-                instruction.rs1 = regT1;
+        workList = new LinkedList<ASMInstruction>();
+        for (ASMInstruction inst : block.instructions) {
+            if (inst.rs1 != null && !(inst.rs1 instanceof ASMPhysicalRegister)) {
+                allocateSrc(RegT1, inst.rs1);
+                inst.rs1 = RegT1;
             }
-            if (instruction.rs2 != null && !(instruction.rs2 instanceof ASMPhysicalRegister)) {
-                allocateSrc(extendedIns, regT0, instruction.rs2);
-                instruction.rs2 = regT0;
+            if (inst.rs2 != null && !(inst.rs2 instanceof ASMPhysicalRegister)) {
+                allocateSrc(RegT0, inst.rs2);
+                inst.rs2 = RegT0;
             }
-            extendedIns.add(instruction);
-            // 为什么在这里 add？没执行完不要管 rd 的分配状况！！！！！！！！！！！！！！！！11
-            if (instruction.rd != null && !(instruction.rd instanceof ASMPhysicalRegister)) {
-                allocateDest(extendedIns, regT0, instruction.rd);
-                instruction.rd = regT0;
+            workList.add(inst);
+            if (inst.rd != null && !(inst.rd instanceof ASMPhysicalRegister)) {
+                allocaDest(RegT0, inst.rd);
+                inst.rd = RegT0;
             }
         }
-        block.instructions = extendedIns;
+        block.instructions = workList;
     }
 
-    private void allocateSrc(LinkedList<ASMInstruction> insList, ASMPhysicalRegister reg, ASMRegister src) {
-        // 从 src 里面 load 到 reg
+    void allocateSrc(ASMPhysicalRegister reg, ASMRegister src) {
         if (src instanceof ASMVirtualRegister) {
-            int addrOffset = ((ASMVirtualRegister) src).isExceedingParam ?
-                    totalStackBytes + ((ASMVirtualRegister) src).parameterId * 4 :
-                    virtualRegPos + ((ASMVirtualRegister) src).id * 4;
-            // 实际地址 - sp 的值
-
-            if (addrOffset < 2048) {
-                insList.add(new ASMLoad(((ASMVirtualRegister) src).size, reg, new ASMImmediate(addrOffset), regSp));
-            } else {
-                insList.add(new ASMLi(regT2, new ASMVirtualImmediate(addrOffset)));
-                insList.add(new ASMRType("add", regT2, regT2, regSp));
-                insList.add(new ASMLoad(((ASMVirtualRegister) src).size, reg, regT2));
+            int offset = ((ASMVirtualRegister) src).id != -1
+                    ? virtualRegBegin + ((ASMVirtualRegister) src).id * 4
+                    : totalStack + ((ASMVirtualRegister) src).parameterId * 4;
+            if (offset < 1 << 11)
+                workList.add(new ASMLoad(((ASMVirtualRegister) src).size, reg, new ASMImmediate(offset), RegSp));
+            else {
+                workList.add(new ASMLi(RegT2, new ASMVirtualImmediate(offset)));
+                workList.add(new ASMRType("add", RegT2, RegT2, RegSp));
+                workList.add(new ASMLoad(((ASMVirtualRegister) src).size, reg, RegT2));
             }
-        }
-        else if (src instanceof ASMVirtualImmediate) {
-            insList.add(new ASMLi(reg, (ASMVirtualImmediate) src));
-        }
-        else if (src instanceof ASMGlobal) {
-            insList.add(new ASMLa(reg, ((ASMGlobal) src).label));
+        } else if (src instanceof ASMVirtualImmediate) {
+            workList.add(new ASMLi(reg, (ASMVirtualImmediate) src));
+        } else if (src instanceof ASMGlobal) {
+            workList.add(new ASMLui(reg, new ASMRelocation(ASMRelocation.Type.hi, ((ASMGlobal) src).label)));
+            workList.add(new ASMIType("addi", reg, reg, new ASMRelocation(ASMRelocation.Type.lo, ((ASMGlobal) src).label)));
         }
     }
 
-    private void allocateDest(LinkedList<ASMInstruction> insList, ASMPhysicalRegister reg, ASMRegister dest) {
-        // reg 存到 dest
+    void allocaDest(ASMPhysicalRegister reg, ASMRegister dest) {
         if (dest instanceof ASMVirtualRegister) {
-            int addrOffset = ((ASMVirtualRegister) dest).isExceedingParam ?
-                    totalStackBytes + ((ASMVirtualRegister) dest).parameterId * 4 :
-                    virtualRegPos + ((ASMVirtualRegister) dest).id * 4;
-            // 实际地址 - sp 的值
-
-            if (addrOffset < 2048) {
-                insList.add(new ASMStore(((ASMVirtualRegister) dest).size, reg, new ASMImmediate(addrOffset), regSp));
-            } else {
-                insList.add(new ASMLi(regT2, new ASMVirtualImmediate(addrOffset)));
-                insList.add(new ASMRType("add", regT2, regT2, regSp));
-                insList.add(new ASMStore(((ASMVirtualRegister) dest).size, reg, regT2));
+            int offset = ((ASMVirtualRegister) dest).id != -1
+                    ? virtualRegBegin + ((ASMVirtualRegister) dest).id * 4
+                    : totalStack + ((ASMVirtualRegister) dest).parameterId * 4;
+            if (offset < 1 << 11)
+                workList.add(new ASMStore(((ASMVirtualRegister) dest).size, reg, new ASMImmediate(offset), RegSp));
+            else {
+                workList.add(new ASMLi(RegT2, new ASMVirtualImmediate(offset)));
+                workList.add(new ASMRType("add", RegT2, RegT2, RegSp));
+                workList.add(new ASMStore(((ASMVirtualRegister) dest).size, reg, RegT2));
             }
         }
     }
